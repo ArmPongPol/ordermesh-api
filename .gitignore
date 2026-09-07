@@ -3,6 +3,9 @@
 /node_modules
 /build
 
+# generated OpenAPI spec (npm run docs:json)
+/openapi.json
+
 # Logs
 logs
 *.log
@@ -36,11 +39,11 @@ lerna-debug.log*
 !.vscode/extensions.json
 
 # dotenv environment variable files
+# Only .env.example is tracked - every other env file holds real credentials.
 .env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
+.env.*
+!.env.example
+!.env.production.example
 
 # temp directory
 .temp

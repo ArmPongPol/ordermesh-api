@@ -1,0 +1,17 @@
+node_modules
+dist
+coverage
+openapi.json
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+.vscode
+.idea
+test
+README.md
+docker-compose.yaml
+Dockerfile
+.dockerignore
