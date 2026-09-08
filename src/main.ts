@@ -25,6 +25,7 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const configService = app.get(ConfigService);
 
+  const host = configService.getOrThrow<string>('app.host');
   const port = configService.get<number>('app.port') ?? 3001;
   const corsOrigin = configService.get<string[]>('app.corsOrigin') || [];
   const corsCredentials = configService.get<boolean>('app.corsCredentials');
@@ -109,8 +110,8 @@ async function bootstrap() {
     );
   }
 
-  await app.listen(port);
-  logger.log(`Application is running on: http://localhost:${port}`);
+  await app.listen(port, host);
+  logger.log(`Application is running on: http://${host}:${port}`);
 }
 bootstrap().catch((err) => {
   const logger = new Logger('Bootstrap');

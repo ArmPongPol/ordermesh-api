@@ -1,0 +1,689 @@
+// ===========================================================================
+// OrderMesh — MVP v1 database schema (revised)
+// ===========================================================================
+// Paste into https://dbdiagram.io to render.
+//
+// Revision markers:
+//   [FIX n] — corrects a defect found in the schema review (see docs/schema-review.md)
+//   [DEC n] — a decision that was implicit before and is now explicit; safe to
+//             reverse, but decide deliberately rather than by omission.
+//
+// Implementation notes that DBML cannot express are carried in table `Note:`
+// blocks. Read them before writing the migration — several are load-bearing.
+// ===========================================================================
+
+
+// ---------------------------------------------------------------------------
+// Status vocabularies
+// ---------------------------------------------------------------------------
+// [DEC 1] Statuses were bare `varchar` with the allowed values buried in prose
+// notes, so nothing — not the DB, not the diagram — stated the state machine.
+// They are modelled as enums here for readability.
+//
+// IMPLEMENT AS `varchar` + a CHECK constraint, NOT as a native Postgres enum:
+// `ALTER TYPE ... ADD VALUE` cannot run in the same transaction that uses the
+// new value, and renaming or removing a value is close to impossible. A CHECK
+// constraint is dropped and recreated in one ordinary migration.
+//
+//   status varchar NOT NULL
+//     CONSTRAINT orders_status_check
+//     CHECK (status IN ('PENDING_PAYMENT','PAID','PACKING','SHIPPED','DELIVERED','CANCELLED'))
+
+Enum user_status {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+Enum product_status {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+Enum sku_status {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+Enum warehouse_status {
+  ACTIVE
+  INACTIVE
+}
+
+Enum order_status {
+  PENDING_PAYMENT
+  PAID
+  PACKING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+Enum movement_type {
+  RECEIVE
+  RESERVE
+  RELEASE
+  DEDUCT
+  ADJUST
+}
+
+Enum reservation_status {
+  ACTIVE
+  RELEASED
+  CONSUMED
+  EXPIRED
+}
+
+Enum payment_status {
+  PENDING
+  SUCCESS
+  FAILED
+  TIMEOUT
+}
+
+Enum webhook_result {
+  SUCCESS
+  FAILED
+  TIMEOUT
+  DUPLICATE_WEBHOOK
+}
+
+Enum shipment_status {
+  PACKING
+  SHIPPED
+  DELIVERED
+}
+
+Enum outbox_status {
+  PENDING
+  SENT
+  FAILED
+  DEAD_LETTER
+}
+
+
+// ---------------------------------------------------------------------------
+// Identity & access
+// ---------------------------------------------------------------------------
+
+Table users {
+  id uuid [pk]
+  email varchar [not null, unique]
+  password_hash varchar [not null]
+  full_name varchar [not null]
+  status user_status [not null]
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+
+  Note: '''
+  [FIX 3] `email` is unique but case-sensitive, so Somchai@example.com and
+  somchai@example.com can both register and then race for the same identity.
+  The migration must enforce case-insensitive uniqueness instead:
+
+    CREATE UNIQUE INDEX uq_users_email_lower ON users (lower(email));
+
+  and drop the plain unique constraint. Store the address as the user typed it
+  (receipts and support replies should show their casing) but match on lower().
+  Alternatively enable the citext extension and type the column citext.
+  '''
+}
+
+Table roles {
+  id uuid [pk]
+  name varchar [not null, unique]
+  description varchar
+}
+
+Table user_roles {
+  user_id uuid [not null, ref: > users.id]
+  role_id uuid [not null, ref: > roles.id]
+
+  indexes {
+    (user_id, role_id) [pk]
+    // The composite PK indexes user_id already; role_id needs its own for
+    // "who holds this role" and to keep role deletes from scanning the table.
+    (role_id) // [FIX 4]
+  }
+}
+
+Table customer_profiles {
+  id uuid [pk]
+  user_id uuid [not null, unique, ref: > users.id]
+  phone varchar
+  default_shipping_address text
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+
+  Note: '''
+  `default_shipping_address` prefills the checkout form. It is NOT the address
+  an order shipped to — see the snapshot columns on `orders` ([FIX 2]).
+  '''
+}
+
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+Table products {
+  id uuid [pk]
+  name varchar [not null]
+  description text
+  category varchar
+  status product_status [not null]
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+
+  indexes {
+    (status, category) // [FIX 4] storefront browse
+  }
+}
+
+Table skus {
+  id uuid [pk]
+  product_id uuid [not null, ref: > products.id]
+  sku_code varchar [not null, unique]
+  variant_label varchar
+  price_satang bigint [not null]
+  image_url varchar
+  status sku_status [not null]
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+
+  indexes {
+    (product_id) // [FIX 4] list variants of a product
+  }
+
+  Note: '''
+  `price_satang` is the CURRENT list price. It is never read back for a placed
+  order — `order_items.unit_price_satang` holds the price at purchase time.
+
+  Add CHECK (price_satang >= 0).
+  '''
+}
+
+
+// ---------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------
+
+Table warehouses {
+  id uuid [pk]
+  name varchar [not null]
+  address text
+  status warehouse_status [not null]
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+}
+
+Table stock_balances {
+  id uuid [pk]
+  sku_id uuid [not null, ref: > skus.id]
+  warehouse_id uuid [not null, ref: > warehouses.id]
+  on_hand bigint [not null, default: 0]
+  reserved bigint [not null, default: 0]
+  version bigint [not null, default: 0, note: 'Optimistic lock']
+  updated_at timestamptz [not null]
+
+  indexes {
+    (sku_id, warehouse_id) [unique]
+    (warehouse_id) // [FIX 4] whole-warehouse stock views
+  }
+
+  Note: '''
+  [FIX 6] Add a CHECK constraint as the last line of defence against overselling.
+  Application logic guards this today; a bug there corrupts the ledger silently,
+  and negative stock is very hard to reconcile after the fact.
+
+    CONSTRAINT stock_balances_non_negative
+      CHECK (on_hand >= 0 AND reserved >= 0 AND reserved <= on_hand)
+
+  Available quantity is a derived value: on_hand - reserved. Do not store it.
+  '''
+}
+
+Table stock_movements {
+  id uuid [pk]
+  sku_id uuid [not null, ref: > skus.id]
+  warehouse_id uuid [not null, ref: > warehouses.id]
+
+  movement_type movement_type [not null]
+
+  quantity bigint [not null]
+
+  reference_id uuid [
+    note: 'Polymorphic reference e.g. order_id / adjustment_id'
+  ]
+
+  reference_type varchar
+
+  performed_by uuid [ref: > users.id]
+
+  created_at timestamptz [not null]
+
+  indexes {
+    (sku_id, warehouse_id, created_at) // [FIX 4] per-SKU ledger replay
+    (reference_type, reference_id)     // [FIX 4] "what did this order move?"
+    (created_at)                       // [FIX 4] date-ranged reports
+  }
+
+  Note: '''
+  Append-only ledger: rows are never updated or deleted. The sign convention
+  must be fixed in code and stated here — recommend `quantity` always positive,
+  with `movement_type` carrying the direction, so SUM() is always by type.
+
+  `reference_id` is polymorphic, so no FK can enforce it. That is an accepted
+  trade-off for a ledger, but it means orphan references are possible; the
+  reconciliation job should report them rather than assume they cannot exist.
+  '''
+}
+
+Table stock_reservations {
+  id uuid [pk]
+
+  sku_id uuid [not null, ref: > skus.id]
+  warehouse_id uuid [not null, ref: > warehouses.id]
+  order_item_id uuid [not null, ref: > order_items.id]
+
+  quantity bigint [not null]
+
+  status reservation_status [not null]
+
+  created_at timestamptz [not null]
+  expires_at timestamptz [not null] // [FIX 3]
+  released_at timestamptz
+
+  indexes {
+    (order_item_id)          // [FIX 4]
+    (sku_id, status)         // [FIX 4] active reservations for a SKU
+    (status, expires_at)     // [FIX 4] the sweeper reads exactly this
+    (warehouse_id)           // [FIX 4]
+  }
+
+  Note: '''
+  [FIX 3] `expires_at` did not exist. Without it a customer who places an order
+  and never pays holds their stock forever: the reservation stays ACTIVE, the
+  balance stays reserved, and the storefront reports "out of stock" while the
+  goods sit in the warehouse. This is the single most damaging gap in the draft
+  because it degrades silently and only under real traffic.
+
+  Required alongside this column:
+    - Set expires_at = created_at + payment window (15-30 min is typical).
+    - A scheduled sweeper moves ACTIVE rows past expires_at to EXPIRED, writes a
+      RELEASE movement, and decrements stock_balances.reserved — in ONE
+      transaction, taking the optimistic lock on stock_balances.
+    - EXPIRED is distinct from RELEASED on purpose: RELEASED means a human or
+      the system cancelled deliberately, EXPIRED means the payment window ran
+      out. Collapsing them loses the abandonment rate signal.
+
+  Add CHECK (quantity > 0).
+  '''
+}
+
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+Table orders {
+  id uuid [pk]
+
+  customer_id uuid [
+    not null,
+    ref: > customer_profiles.id
+  ]
+
+  status order_status [not null]
+
+  // [FIX 2] Delivery snapshot — captured at order creation, never updated.
+  recipient_name varchar [not null]
+  recipient_phone varchar [not null]
+  shipping_address text [not null]
+
+  // [DEC 2] Money breakdown.
+  subtotal_satang bigint [not null, note: 'Sum of order_items.subtotal_satang']
+  shipping_fee_satang bigint [not null, default: 0]
+  discount_satang bigint [not null, default: 0]
+  total_amount_satang bigint [not null, note: 'subtotal + shipping - discount']
+
+  idempotency_key varchar [
+    not null,
+    unique
+  ]
+
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+
+  indexes {
+    (customer_id, created_at) // [FIX 4] "my orders", newest first
+    (status, created_at)      // [FIX 4] admin fulfilment queue
+  }
+
+  Note: '''
+  [FIX 2] The draft snapshotted unit price on order_items but read the delivery
+  address live from customer_profiles. A customer who moves house then loses the
+  record of where past orders were actually sent — which is the address that
+  matters in a delivery dispute, a chargeback, or a tax audit. Copy the address
+  in at creation and never write to these columns again.
+
+  [DEC 2] `total_amount_satang` alone left nowhere to put a delivery fee or a
+  discount, so any later promotion or paid shipping forces a schema migration on
+  a table that by then holds live orders. The four columns cost nothing now.
+  If v1 truly charges neither, keep them at their defaults of 0 — do not drop
+  them. Reconcile in the migration:
+
+    CHECK (total_amount_satang = subtotal_satang + shipping_fee_satang - discount_satang)
+    CHECK (subtotal_satang >= 0 AND shipping_fee_satang >= 0 AND discount_satang >= 0)
+  '''
+}
+
+Table order_items {
+  id uuid [pk]
+
+  order_id uuid [
+    not null,
+    ref: > orders.id
+  ]
+
+  sku_id uuid [
+    not null,
+    ref: > skus.id
+  ]
+
+  quantity int [not null]
+
+  unit_price_satang bigint [
+    not null,
+    note: 'Price snapshot at order creation'
+  ]
+
+  subtotal_satang bigint [not null]
+
+  indexes {
+    (order_id)             // [FIX 4]
+    (sku_id)               // [FIX 4] "who bought this SKU"
+    (order_id, sku_id) [unique] // [DEC 5]
+  }
+
+  Note: '''
+  [DEC 5] The unique (order_id, sku_id) makes one SKU appear at most once per
+  order, so "add to cart" twice increments quantity instead of creating a second
+  line. Drop this index if a line ever needs its own attributes — gift wrapping,
+  an engraving, a per-line note — because then two lines of the same SKU are
+  legitimately different things. Decide now: adding the constraint later means
+  merging duplicate rows in production data.
+
+  Add CHECK (quantity > 0 AND unit_price_satang >= 0)
+  and CHECK (subtotal_satang = unit_price_satang * quantity).
+  '''
+}
+
+Table order_timeline_events {
+  id uuid [pk]
+
+  order_id uuid [
+    not null,
+    ref: > orders.id
+  ]
+
+  event_type varchar [not null]
+  note text
+
+  created_at timestamptz [not null]
+
+  indexes {
+    (order_id, created_at) // [FIX 4]
+  }
+
+  Note: '''
+  Customer-facing order history ("Paid", "Packed", "Handed to courier").
+  Distinct from `audit_logs`, which is internal and records who changed what.
+  Keep the split: this one is safe to show a customer, audit_logs is not.
+  '''
+}
+
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+Table payment_intents {
+  id uuid [pk]
+
+  order_id uuid [
+    not null,
+    ref: > orders.id
+  ]
+
+  amount_satang bigint [not null]
+
+  status payment_status [not null]
+
+  idempotency_key varchar [
+    not null,
+    unique
+  ]
+
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+
+  indexes {
+    (order_id)           // [FIX 4]
+    (status, created_at) // [FIX 4] reconciliation sweeps of stuck PENDING rows
+  }
+
+  Note: '''
+  Several intents per order is correct and intended: a FAILED or TIMEOUT attempt
+  is followed by a new intent, and the history of attempts is worth keeping.
+
+  [FIX 5] But nothing stopped TWO of them reaching SUCCESS — a double charge,
+  which is the worst failure mode this system has. DBML cannot express a partial
+  index, so the migration must add it by hand:
+
+    CREATE UNIQUE INDEX uq_payment_intents_one_success
+      ON payment_intents (order_id)
+      WHERE status = 'SUCCESS';
+
+  With that index the second concurrent webhook fails on insert/update instead
+  of quietly recording a second successful payment. Handle the violation as
+  "already paid", not as a 500.
+
+  Add CHECK (amount_satang > 0).
+  '''
+}
+
+Table payment_webhook_events {
+  id uuid [pk]
+
+  payment_intent_id uuid [
+    not null,
+    ref: > payment_intents.id
+  ]
+
+  external_event_id varchar [
+    not null,
+    unique
+  ]
+
+  result webhook_result [not null]
+
+  processed boolean [
+    not null,
+    default: false
+  ]
+
+  received_at timestamptz [not null]
+  processed_at timestamptz
+
+  indexes {
+    (payment_intent_id)        // [FIX 4]
+    (processed, received_at)   // [FIX 4] the retry worker reads exactly this
+  }
+
+  Note: '''
+  `external_event_id` unique is the deduplication key — the provider will resend
+  the same event, and this is what makes the resend harmless. Insert the row
+  FIRST, then act on it, so a crash between the two leaves the event unprocessed
+  rather than processed twice.
+  '''
+}
+
+
+// ---------------------------------------------------------------------------
+// Fulfilment
+// ---------------------------------------------------------------------------
+
+Table shipments {
+  id uuid [pk]
+
+  order_id uuid [
+    not null,
+    ref: > orders.id
+  ]
+
+  warehouse_id uuid [
+    not null,
+    ref: > warehouses.id
+  ]
+
+  tracking_number varchar [
+    unique
+  ]
+
+  status shipment_status [not null]
+
+  created_at timestamptz [not null] // [FIX 1] was missing entirely
+  shipped_at timestamptz
+  delivered_at timestamptz
+
+  indexes {
+    (order_id)             // [FIX 4]
+    (warehouse_id, status) // [FIX 4] warehouse packing queue
+    (status)               // [FIX 4]
+  }
+
+  Note: '''
+  `tracking_number` is nullable and unique — Postgres permits many NULLs in a
+  unique index, so unlabelled PACKING shipments do not collide. That is correct
+  as written.
+
+  The draft had no `created_at`, so a shipment that never shipped had no
+  timestamp at all and could not be aged or chased.
+  '''
+}
+
+Table shipment_items {
+  id uuid [pk]
+
+  shipment_id uuid [
+    not null,
+    ref: > shipments.id
+  ]
+
+  order_item_id uuid [
+    not null,
+    ref: > order_items.id
+  ]
+
+  quantity int [not null]
+
+  indexes {
+    (shipment_id)    // [FIX 4]
+    (order_item_id)  // [FIX 4] how much of this line has shipped
+  }
+
+  Note: '''
+  This table exists to allow partial shipment. If v1 always ships an order whole
+  it can be dropped and shipments joined straight to orders — but see the review:
+  retrofitting partial shipment later is a real migration, so keeping it is the
+  cheaper bet if split shipments are at all likely.
+
+  Add CHECK (quantity > 0). The sum per order_item must not exceed
+  order_items.quantity; enforce that in the service, it cannot be a CHECK.
+  '''
+}
+
+
+// ---------------------------------------------------------------------------
+// Cross-cutting
+// ---------------------------------------------------------------------------
+
+Table audit_logs {
+  id uuid [pk]
+
+  actor_id uuid [
+    ref: > users.id
+  ]
+
+  action varchar [not null]
+  entity_type varchar [not null]
+  entity_id uuid [not null]
+
+  before_state jsonb
+  after_state jsonb
+
+  created_at timestamptz [not null]
+
+  indexes {
+    (entity_type, entity_id, created_at) // [FIX 4] history of one record
+    (actor_id, created_at)               // [FIX 4] what did this user do
+    (created_at)                         // [FIX 4] retention / date reports
+  }
+
+  Note: '''
+  `actor_id` is nullable so system-initiated changes (the reservation sweeper,
+  the outbox worker) can be recorded with no user attached. Write a stable
+  sentinel in `action` for those rather than leaving the row ambiguous.
+  '''
+}
+
+Table outbox_events {
+  id uuid [pk]
+
+  event_type varchar [not null]
+
+  aggregate_id uuid [
+    not null,
+    note: 'Aggregate identifier e.g. order_id'
+  ]
+
+  aggregate_type varchar [not null]
+
+  payload jsonb [not null]
+
+  status outbox_status [not null]
+
+  retry_count int [
+    not null,
+    default: 0
+  ]
+
+  next_retry_at timestamptz // [DEC 4]
+  last_error text           // [DEC 4]
+
+  created_at timestamptz [not null]
+  sent_at timestamptz
+
+  indexes {
+    (status, next_retry_at)           // [FIX 4] the only index the poller needs
+    (aggregate_type, aggregate_id)    // [FIX 4] events for one aggregate
+  }
+
+  Note: '''
+  [FIX 4] The poller runs `WHERE status = 'PENDING'` every few seconds forever.
+  Without an index that is a sequential scan of a table that only grows — the
+  most expensive query in the system, and it gets slower every day.
+
+  [DEC 4] `retry_count` existed with nothing to schedule against, so a failing
+  event would be retried on every single poll: a hot loop against an endpoint
+  that is already unhealthy. `next_retry_at` gives it exponential backoff, and
+  `last_error` means a DEAD_LETTER row explains itself without a log dig.
+
+  Claim rows with SELECT ... FOR UPDATE SKIP LOCKED so more than one worker can
+  run safely. Write the outbox row in the SAME transaction as the state change
+  it describes — that is the entire point of the pattern; a separate transaction
+  reintroduces exactly the lost-event problem it exists to solve.
+  '''
+}
