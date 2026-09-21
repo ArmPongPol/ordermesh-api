@@ -85,4 +85,26 @@ describe('API contract (e2e)', () => {
 
     expect(res.status).toBe(404);
   });
+
+  // Regressions against the global JwtAuthGuard added with auth. Both of these
+  // would be easy to break and neither is obvious from the auth tests.
+  describe('the global auth guard does not disturb the existing contract', () => {
+    it('leaves /health reachable without a token', async () => {
+      const res = await request(app.getHttpServer()).get('/health');
+
+      expect(res.status).not.toBe(401);
+      expect([200, 503]).toContain(res.status);
+    });
+
+    // Unmatched routes 404 in the router before any guard runs. If this ever
+    // returns 401 the API has started leaking which routes exist.
+    it('still 404s an unknown route rather than 401ing it', async () => {
+      const res = await request(app.getHttpServer()).get(
+        '/api/v1/does-not-exist',
+      );
+
+      expect(res.status).toBe(404);
+      expect((res.body as ApiErrorResponseDto).code).toBe('NOT_FOUND');
+    });
+  });
 });

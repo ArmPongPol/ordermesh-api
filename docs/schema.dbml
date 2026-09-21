@@ -110,23 +110,31 @@ Enum outbox_status {
 
 Table users {
   id uuid [pk]
-  email varchar [not null, unique]
+  email varchar [not null]
   password_hash varchar [not null]
   full_name varchar [not null]
-  status user_status [not null]
+  status user_status [not null, default: 'ACTIVE'] // [IMPL 1]
   created_at timestamptz [not null]
   updated_at timestamptz [not null]
 
   Note: '''
-  [FIX 3] `email` is unique but case-sensitive, so Somchai@example.com and
-  somchai@example.com can both register and then race for the same identity.
-  The migration must enforce case-insensitive uniqueness instead:
+  [FIX 3] `email` was unique but case-sensitive, so Somchai@example.com and
+  somchai@example.com could both register and then race for the same identity.
+  IMPLEMENTED: the plain unique constraint is gone and uniqueness comes from
 
     CREATE UNIQUE INDEX uq_users_email_lower ON users (lower(email));
 
-  and drop the plain unique constraint. Store the address as the user typed it
-  (receipts and support replies should show their casing) but match on lower().
-  Alternatively enable the citext extension and type the column citext.
+  The address is stored as the user typed it (receipts and support replies
+  should show their casing); every lookup matches on lower(email), which uses
+  this index.
+
+  DO NOT add `unique: true` back to the entity column. TypeORM cannot see
+  expression indexes (an expression column has indkey = 0 in pg_index), so
+  migration:generate will never drop uq_users_email_lower — but it cannot
+  protect it either. Adding a plain unique would leave BOTH constraints in
+  place and silently reopen the case-sensitivity hole.
+
+  [IMPL 1] `status` had no default; registration needs one. Set to 'ACTIVE'.
   '''
 }
 
@@ -134,11 +142,59 @@ Table roles {
   id uuid [pk]
   name varchar [not null, unique]
   description varchar
+  is_system boolean [not null, default: false] // [IMPL 2]
+  created_at timestamptz [not null]             // [IMPL 2]
+  updated_at timestamptz [not null]             // [IMPL 2]
+
+  Note: '''
+  [IMPL 2] Timestamps and `is_system` are deliberate additions to the draft.
+
+  Roles are user-editable now — an admin retunes a role's permissions through
+  the API rather than through a deploy — so "when did this change" became a
+  real question. `is_system` marks the five seeded roles so an admin UI can
+  refuse to delete or rename them; losing ADMIN locks everyone out.
+
+  Seeded roles: ADMIN, OPS_MANAGER, WAREHOUSE_STAFF, SUPPORT, CUSTOMER.
+  CUSTOMER is granted automatically on self-registration.
+  '''
+}
+
+// [IMPL 3] Not in the draft, which had roles but no way to say what a role
+// may actually do — every check would have hardcoded role NAMES in
+// controllers, so any policy change meant a deploy.
+Table permissions {
+  id uuid [pk]
+  code varchar [not null, unique]
+  resource varchar [not null]
+  action varchar [not null]
+  description varchar
+  created_at timestamptz [not null]
+
+  Note: '''
+  Codes are `<resource>:<action>`, lowercase snake, singular resource. A
+  trailing `:any` means "across all owners"; the bare form means "own records
+  only" — so `order:read` and `order:read:any` are different grants.
+
+  Enforced by a CHECK, because a typo'd code is otherwise unfalsifiable: a
+  route requiring 'order:updat' would simply 403 forever and look like a
+  misconfigured role.
+
+    CONSTRAINT permissions_code_format_check
+      CHECK (code ~ '^[a-z_]+:[a-z_]+(:any)?$')
+
+  The codes are referenced from source (`@RequirePermissions(...)`), so they
+  ship with the deploy: the migration seeds them, and a unit test asserts the
+  TypeScript catalogue still matches what was seeded. A separate seed script
+  would leave a freshly migrated production database with every guarded route
+  403ing until someone remembered to run it.
+  '''
 }
 
 Table user_roles {
   user_id uuid [not null, ref: > users.id]
   role_id uuid [not null, ref: > roles.id]
+  assigned_at timestamptz [not null]            // [IMPL 4]
+  assigned_by uuid [ref: > users.id]            // [IMPL 4]
 
   indexes {
     (user_id, role_id) [pk]
@@ -146,6 +202,108 @@ Table user_roles {
     // "who holds this role" and to keep role deletes from scanning the table.
     (role_id) // [FIX 4]
   }
+
+  Note: '''
+  [IMPL 4] `assigned_at` / `assigned_by` are additions to the draft. "Who
+  granted this person payment:refund, and when" is the first question a
+  privilege-escalation incident asks, and without these columns the answer is
+  unrecoverable.
+
+  `assigned_by` is nullable and ON DELETE SET NULL: grants made by the system
+  (registration, seeding) have no actor, and removing the admin who made a
+  grant must not delete the grant itself.
+
+  Modelled as an explicit table rather than a many-to-many join, because these
+  audit columns cannot live on a generated join table.
+  '''
+}
+
+// [IMPL 3] Which permissions a role confers. Editable at runtime by an admin;
+// the migration only seeds the initial grants.
+Table role_permissions {
+  role_id uuid [not null, ref: > roles.id]
+  permission_id uuid [not null, ref: > permissions.id]
+  granted_at timestamptz [not null]
+
+  indexes {
+    (role_id, permission_id) [pk]
+    (permission_id) // "which roles grant this", and permission deletes
+  }
+
+  Note: '''
+  ADMIN holds every permission as explicit rows, seeded with a CROSS JOIN, and
+  NOT as a wildcard bypass in the authorization guard. The CROSS JOIN keeps it
+  correct as later migrations add permissions, and the explicit rows mean "who
+  can refund a payment" is one SQL query with no special case to audit.
+
+  Both foreign keys are ON DELETE CASCADE: a deleted role or permission should
+  take its grants with it.
+  '''
+}
+
+// [IMPL 5] Not in the draft, which had no session storage at all — so logout
+// and "sign out everywhere" could not have worked.
+Table refresh_tokens {
+  id uuid [pk]
+  user_id uuid [not null, ref: > users.id]
+  family_id uuid [not null]
+  token_hash varchar [not null]
+  user_agent varchar
+  ip varchar
+  created_at timestamptz [not null]
+  expires_at timestamptz [not null]
+  family_expires_at timestamptz [not null]
+  revoked_at timestamptz
+  revoked_reason varchar
+  replaced_by_token_id uuid
+
+  indexes {
+    (user_id)
+    (family_id)
+    (expires_at) // partial: WHERE revoked_at IS NULL — the sweeper's index
+  }
+
+  Note: '''
+  TOKEN FORMAT. argon2 hashes are salted, so `WHERE token_hash = ?` is
+  impossible. The value handed to the client is compound:
+
+    <row id uuid>.<base64url(32 random bytes)>
+
+  The server splits on the first dot, loads the row by primary key, then
+  verifies the secret against token_hash. One indexed lookup, one verify.
+  Token hashing uses REDUCED argon2 parameters (m=8192, t=1, p=1), not the
+  password ones: the secret is 32 bytes of CSPRNG output, so there is no
+  dictionary to grind and the password cost would be paid on every refresh.
+
+  ROTATION AND REUSE. Every token descended from one login shares `family_id`.
+  Refreshing retires the presented token (revoked_reason = 'ROTATED',
+  replaced_by_token_id = the new row) and issues its replacement in the same
+  family, inside one transaction with SELECT ... FOR UPDATE so two concurrent
+  refreshes cannot both win.
+
+  Presenting a token that was ALREADY rotated means the value leaked, and the
+  thief cannot be distinguished from the legitimate holder — so the whole
+  family is revoked ('REUSE_DETECTED') and both must re-authenticate. Note
+  that this revocation must NOT be performed inside the rotation transaction:
+  the exception that reports it would roll the revocation back.
+
+  A valid row id with a WRONG secret is NOT treated as reuse. Revoking there
+  would let anyone who can guess a token id log that session out at will.
+
+  ABSOLUTE CAP. `family_expires_at` is copied forward unchanged on every
+  rotation. Without it a stolen token that keeps rotating never expires — the
+  sliding window renews itself indefinitely.
+
+    CONSTRAINT refresh_tokens_expiry_order_check
+      CHECK (expires_at <= family_expires_at)
+    CONSTRAINT refresh_tokens_revoked_reason_check
+      CHECK (revoked_reason IS NULL OR revoked_reason IN
+        ('ROTATED','LOGOUT','LOGOUT_ALL','REUSE_DETECTED','USER_DISABLED'))
+
+  The sweeper index is partial (WHERE revoked_at IS NULL) because the table is
+  append-mostly: the revoked majority would otherwise bloat it. Expired rows
+  are never deleted on the request path; a retention job is a TODO.
+  '''
 }
 
 Table customer_profiles {

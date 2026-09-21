@@ -22,6 +22,11 @@ export function buildDataSourceOptions(
 ): DataSourceOptions {
   return {
     type: 'postgres',
+    // Without this TypeORM expects `uuid_generate_v4()` (uuid-ossp) as the
+    // default for @PrimaryGeneratedColumn('uuid') and reports permanent drift
+    // against the migration's `DEFAULT gen_random_uuid()`. pgcrypto ships
+    // gen_random_uuid(), and Postgres 15 has it in core regardless.
+    uuidExtension: 'pgcrypto',
     host: settings.host,
     port: settings.port,
     username: settings.username,

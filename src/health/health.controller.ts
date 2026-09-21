@@ -9,12 +9,17 @@ import {
 } from '@nestjs/terminus';
 import { SkipThrottle } from '@nestjs/throttler';
 import { SkipTransform } from '../common/decorators/skip-transform.decorator';
+import { Public } from '../auth/decorators/public.decorator';
 
 const MB = 1024 * 1024;
 
 @ApiTags('Health')
 // Probes poll far more often than a user would; they must not consume the quota.
 @SkipThrottle()
+// Load balancers and container probes have no credentials. Without this the
+// global JwtAuthGuard would 401 every probe and the container would be killed
+// as unhealthy.
+@Public()
 @Controller('health')
 export class HealthController {
   constructor(

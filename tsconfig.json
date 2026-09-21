@@ -1,4 +1,11 @@
 {
+  // ts-node resolves files on demand from the entry point, so a global
+  // declaration that nothing imports - src/auth/types/express.d.ts, which
+  // augments Express.Request with `user` - is invisible to it, and
+  // `npm run docs:json` / `seed:admin` fail on a type that `tsc` and
+  // `nest build` both accept. `files: true` makes ts-node honour the project's
+  // include set the way a full compile does.
+  "ts-node": { "files": true },
   "compilerOptions": {
     "module": "nodenext",
     "moduleResolution": "nodenext",
